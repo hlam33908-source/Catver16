@@ -6,6 +6,7 @@ import asyncio
 from PIL import Image, ImageDraw, ImageFont
 import io
 import math
+import os
 from flask import Flask
 import threading
 
@@ -28,7 +29,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 games = {}
 
-# --- TỪ ĐIỂN DỮ LIỆU VÀ HÌNH ẢNH (GIỮ NGUYÊN 100%) ---
+# --- TỪ ĐIỂN DỮ LIỆU VÀ HÌNH ẢNH ---
 CARD_SKILLS = {
     'Bỏ qua (Skip)': 'Kết thúc 1 lượt rút của bạn mà không cần rút.',
     'Tấn công (Attack)': 'Kết thúc lượt không rút bài, ép người kế tiếp phải rút 2 lượt.',
@@ -101,7 +102,7 @@ CARD_IMAGES = {
     'Vả ba': 'https://cdn.discordapp.com/attachments/1522930842270171257/1531998029102448700/IMG_20260729_191154.jpg?ex=6a6b3fd9&is=6a69ee59&hm=563295d9eafc1ccc9a20254a5cc869c0492725a90f2210b330ef9ff79ff41e7c&',
 }
 
-# --- CÁC HÀM TIỆN ÍCH GIAO DIỆN (GIỮ NGUYÊN 100%) ---
+# --- CÁC HÀM TIỆN ÍCH GIAO DIỆN ---
 def format_hand(hand_list):
     if not hand_list: return "Tay bạn đang trống không!"
     counts = Counter(hand_list)
@@ -281,10 +282,19 @@ class ExplodingKittensGame:
         return False
 
     async def update_board(self, channel):
+        # KHẮC PHỤC 429: Dùng edit() thay vì xóa và gửi mới liên tục để tiết kiệm API request
+        embed = get_game_embed(self)
+        file = create_table_image(self)
+        view = GameActionView(self)
+        
         if self.main_message:
-            try: await self.main_message.delete()
-            except: pass
-        self.main_message = await channel.send(embed=get_game_embed(self), file=create_table_image(self), view=GameActionView(self))
+            try:
+                await self.main_message.edit(embed=embed, attachments=[file], view=view)
+                return
+            except Exception:
+                pass # Nếu tin nhắn cũ bị lỗi/xóa thì gửi mới hoàn toàn bên dưới
+        
+        self.main_message = await channel.send(embed=embed, file=file, view=view)
 
     async def handle_bomb_explosion(self, channel, player, drawn_card, from_search=False, top_5_deck=None):
         if drawn_card == 'Mèo Nổ Sập (Ngửa)':
@@ -306,7 +316,7 @@ class ExplodingKittensGame:
 
 
 # ====================================================================================
-# --- HỆ THỐNG GIAO DIỆN & COMBO MỚI ---
+# --- GIAO DIỆN & UI ---
 # ====================================================================================
 
 class LobbyView(discord.ui.View):
@@ -408,7 +418,7 @@ class GameActionView(discord.ui.View):
             await self.game.update_board(interaction.channel)
         else: 
             is_next = self.game.advance_turn()
-            if is_next: await self.game.update_board(channel=interaction.channel)
+            if is_next: await self.game.update_board(interaction.channel)
             else: await interaction.channel.send(f"⚠️ Vẫn còn {self.game.turns_left} lượt rút nữa!")
 
     @discord.ui.button(label="Đánh Bài", style=discord.ButtonStyle.primary, custom_id="play", emoji="🔥")
@@ -452,7 +462,7 @@ class PlaySelectView(discord.ui.View):
         
         hand = game.hands[player]
         options = []
-        for i, card in enumerate(hand[:25]): # Discord giới hạn tối đa 25 option trong Select
+        for i, card in enumerate(hand[:25]):
             options.append(discord.SelectOption(label=f"{i+1}. {card}", value=f"{i}:{card}"))
         
         self.select = discord.ui.Select(placeholder="Chọn từ 1 đến 5 lá bài...", min_values=1, max_values=min(5, len(options)), options=options)
@@ -465,7 +475,6 @@ class PlaySelectView(discord.ui.View):
         played_cards = [v.split(':', 1)[1] for v in values]
         num_played = len(played_cards)
         
-        # 1. Đánh đơn (1 lá)
         if num_played == 1:
             card = played_cards[0]
             if card in ['Tháo Gỡ (Defuse)', 'Mèo Nổ (Exploding Kitten)', 'Mèo sọc (Streaking Kitten)', 'Chặn (Nope)', 'Mèo Nổ Sập (Úp)', 'Mèo Nổ Sập (Ngửa)']:
@@ -480,7 +489,6 @@ class PlaySelectView(discord.ui.View):
             await interaction.response.edit_message(content="✅ Đang xử lý...", view=None)
             await execute_play_logic(interaction.channel, self.game, self.player, played_cards, indices, None)
 
-        # 2. Đánh đôi (2 lá giống nhau hoặc kết hợp Mèo hoang) -> Cướp 1 lá ngẫu nhiên
         elif num_played == 2:
             c1, c2 = played_cards[0], played_cards[1]
             is_cat_1 = any(cat in c1 for cat in ['Tacocat', 'Cattermelon', 'Khoai Tây', 'Râu Bạc', 'Cầu Vồng', 'Mèo hoang (Feral Cat)'])
@@ -488,21 +496,19 @@ class PlaySelectView(discord.ui.View):
             
             valid_pair = (c1 == c2) or ('Mèo hoang (Feral Cat)' in [c1, c2] and (is_cat_1 or is_cat_2))
             if c1 in ['Tháo Gỡ (Defuse)', 'Mèo Nổ (Exploding Kitten)', 'Mèo Nổ Sập (Úp)', 'Mèo Nổ Sập (Ngửa)', 'Chặn (Nope)', 'Mèo sọc (Streaking Kitten)'] or not valid_pair:
-                return await interaction.response.send_message("❌ Đánh Đôi yêu cầu 2 lá giống hệt nhau (hoặc 1 lá Mèo + 1 Mèo hoang) và không phải lá đặc biệt!", ephemeral=True)
+                return await interaction.response.send_message("❌ Đánh Đôi yêu cầu 2 lá giống hệt nhau (hoặc 1 lá Mèo + 1 Mèo hoang)!", ephemeral=True)
             
             await interaction.response.edit_message(content="🎯 Vui lòng chọn người chơi mục tiêu để cướp bài:", view=TargetSelectView(self.game, self.player, played_cards, indices, combo_type=2))
 
-        # 3. Đánh 3 lá giống nhau -> Gọi tên lá bài muốn lấy
         elif num_played == 3:
             non_feral = [c for c in played_cards if c != 'Mèo hoang (Feral Cat)']
             valid_triple = (len(set(non_feral)) <= 1) and (len(non_feral) > 0)
             
             if played_cards[0] in ['Tháo Gỡ (Defuse)', 'Mèo Nổ (Exploding Kitten)', 'Mèo Nổ Sập (Úp)', 'Mèo Nổ Sập (Ngửa)', 'Chặn (Nope)', 'Mèo sọc (Streaking Kitten)'] or not valid_triple:
-                return await interaction.response.send_message("❌ Đánh 3 lá yêu cầu 3 lá giống hệt nhau (hoặc kết hợp Mèo hoang) và không phải lá đặc biệt!", ephemeral=True)
+                return await interaction.response.send_message("❌ Đánh 3 lá yêu cầu 3 lá giống hệt nhau (hoặc kết hợp Mèo hoang)!", ephemeral=True)
             
             await interaction.response.edit_message(content="🎯 Vui lòng chọn người chơi mục tiêu để gọi tên lá bài muốn lấy:", view=TargetSelectView(self.game, self.player, played_cards, indices, combo_type=3))
 
-        # 5. Đánh 5 lá khác nhau -> Chọn 1 lá bất kỳ từ bộ bài bỏ (discard pile)
         elif num_played == 5:
             if len(set(played_cards)) != 5:
                 return await interaction.response.send_message("❌ Đánh 5 lá yêu cầu **5 lá bài hoàn toàn khác nhau**!", ephemeral=True)
@@ -512,7 +518,7 @@ class PlaySelectView(discord.ui.View):
             
             await interaction.response.edit_message(content="♻️ Chọn 1 lá bài bất kỳ từ bộ bài bỏ:", view=DiscardSelectView(self.game, self.player, played_cards, indices))
         else:
-            return await interaction.response.send_message("❌ Số lượng lá bài không hợp lệ (hệ thống chỉ hỗ trợ đánh 1, 2, 3 hoặc 5 lá)!", ephemeral=True)
+            return await interaction.response.send_message("❌ Số lượng lá bài không hợp lệ (hỗ trợ đánh 1, 2, 3 hoặc 5 lá)!", ephemeral=True)
 
 
 class TargetSelectView(discord.ui.View):
@@ -536,7 +542,6 @@ class TargetSelectView(discord.ui.View):
         target = discord.utils.get(self.game.players, id=int(self.select.values[0]))
         
         if self.combo_type == 2:
-            # Xử lý cướp ngẫu nhiên 1 lá (2 lá giống nhau)
             await interaction.response.edit_message(content="✅ Đang xử lý cướp bài...", view=None)
             for idx in sorted(self.indices, reverse=True):
                 self.game.hands[self.player].pop(idx)
@@ -544,7 +549,7 @@ class TargetSelectView(discord.ui.View):
                 self.game.discard_pile.append(c)
             
             nope_view = NopeView(self.game)
-            await interaction.channel.send(f"⏳ {self.player.mention} đánh Combo 2 lá để cướp bài của {target.mention}.\n", view=nope_view)
+            await interaction.channel.send(f"⏳ {self.player.mention} đánh Combo 2 lá để cướp bài của {target.mention}.", view=nope_view)
             await asyncio.sleep(5)
             
             if nope_view.nope_active:
@@ -573,7 +578,6 @@ class TargetSelectView(discord.ui.View):
             await self.game.update_board(interaction.channel)
 
         elif self.combo_type == 3:
-            # Mở modal gọi tên lá bài (3 lá giống nhau)
             await interaction.response.send_modal(CallOutModal(self.game, self.player, self.played_cards, self.indices, target))
 
 
@@ -830,7 +834,9 @@ async def execute_play_logic(channel, game, current_player, played_cards, indice
             msg_text = "🗑️ **SƯU TẦM RÁC:** Chọn 1 lá bài để ném vào nọc (nhập số):\n"
             for i, c in enumerate(unique_hand): msg_text += f"{i+1}. {c}\n"
             
-            try: await p.send(msg_text)
+            try: 
+                await p.send(msg_text)
+                await asyncio.sleep(0.4) # Chống spam DM rate limit
             except: return p, random.choice(game.hands[p])
             
             def check_gc(m): return m.author == p and m.channel.type == discord.ChannelType.private and m.content.isdigit() and 1 <= int(m.content) <= len(unique_hand)
@@ -966,7 +972,5 @@ async def start_lobby(ctx):
     
     await ctx.send("🎮 **Phòng chờ Mèo Nổ!**", view=LobbyView(game))
 
-# SỬA ĐOẠN NÀY: Dùng os.getenv để lấy token an toàn
-import os
-TOKEN = os.getenv('DISCORD_TOKEN')
-bot.run(TOKEN)
+# Chạy bot an toàn bằng biến môi trường (Render)
+bot.run(os.getenv('DISCORD_TOKEN'))
