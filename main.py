@@ -1,20 +1,26 @@
-import asyncio
+import discord
+from discord.ext import commands
+import random
 from collections import Counter
+import asyncio
+from PIL import Image, ImageDraw, ImageFont
 import io
 import math
 import os
-import random
 from flask import Flask
-import discord
-from discord.ext import commands
-from PIL import Image, ImageDraw, ImageFont
+import threading
 
 app = Flask(__name__)
 
-
-@app.route('/')
+@app.route("/")
 def home():
-  return 'Bot đang chạy!'
+    return "Bot đang chạy!"
+
+def run_web():
+    app.run(host="0.0.0.0", port=8080)
+
+# Chạy Flask song song
+threading.Thread(target=run_web).start()
 
 # --- THIẾT LẬP BOT ---
 intents = discord.Intents.default()
